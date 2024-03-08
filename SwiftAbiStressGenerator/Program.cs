@@ -2,6 +2,7 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace SwiftAbiStressGenerator
 {
@@ -11,12 +12,13 @@ namespace SwiftAbiStressGenerator
         {
             if (args.Length < 2)
             {
-                Console.WriteLine("Usage: SwiftAbiStressGenerator <num functions> <max parameters>");
+                Console.WriteLine("Usage: SwiftAbiStressGenerator <num functions> <max parameters> [--gen-lowering-tests]");
                 return;
             }
 
             int numFunctions = int.Parse(args[0]);
             int maxParameters = int.Parse(args[1]);
+            bool genLoweringTests = args.Contains("--gen-lowering-tests");
 
             Random rand = new Random(1234);
 
@@ -46,7 +48,14 @@ namespace SwiftAbiStressGenerator
             for (int i = 0; i < numFunctions; i++)
             {
                 int numParams = rand.Next(1, maxParameters + 1);
-                paramTypes.Add(GenParameterTypes(rand, numParams, $"F{i}"));
+                if (genLoweringTests)
+                {
+                    paramTypes.Add(new List<InteropType> { GenStructType(rand, numParams, $"F{i}_S") });
+                }
+                else
+                {
+                    paramTypes.Add(GenParameterTypes(rand, numParams, $"F{i}"));
+                }
 
                 foreach (InteropType paramType in paramTypes.Last())
                 {
@@ -70,80 +79,144 @@ namespace SwiftAbiStressGenerator
 
             File.WriteAllText("/Users/jakobbotsch/dev/dotnet/runtime/src/tests/Interop/Swift/SwiftAbiStress/SwiftAbiStress.swift", swift.ToString());
 
-            Invoke("bash", "/Users/jakobbotsch/dev/dotnet/runtime", ["src/tests/build.sh", "-tree:Interop/Swift", "-checked"], true, null);
-            Console.WriteLine("---------- Getting mangled names -----------");
-            string nmOutput = Invoke("nm", "/Users/jakobbotsch/dev/dotnet/runtime/artifacts/tests/coreclr/osx.arm64.Checked/Interop/Swift/SwiftAbiStress/SwiftAbiStress", ["-gU", "libSwiftAbiStress.dylib"], true, null);
-
-            List<string> mangledNames = new();
-            int numMangledNamesFound = 0;
-            foreach (string line in nmOutput.ReplaceLineEndings().Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries))
+            if (genLoweringTests)
             {
-                string mangledName = line.Split(' ')[2];
-                mangledName = mangledName.TrimStart('_');
-                if (mangledName.Contains($"swiftFunc{numMangledNamesFound}"))
+                string[] swiftcArgs = ["-g", "-o", "output.s", "-emit-assembly", "-Xllvm", "--x86-asm-syntax=intel", "-S", "-emit-ir", "-enable-library-evolution", "SwiftAbiStress.swift"];
+                Invoke("swiftc", "/Users/jakobbotsch/dev/dotnet/runtime/src/tests/Interop/Swift/SwiftAbiStress", swiftcArgs, false, null);
+
+                var entries = new List<(string MangledName, string Params)>();
+                string ir = File.ReadAllText("/Users/jakobbotsch/dev/dotnet/runtime/src/tests/Interop/Swift/SwiftAbiStress/output.s");
+                List<string[]?> swiftLowerings = new();
+                int numMangledNamesFound = 0;
+                foreach (Match match in Regex.Matches(ir, "swiftcc i64 @\"(.*)\"\\((.*)\\)"))
                 {
-                    mangledNames.Add(mangledName);
-                    numMangledNamesFound++;
+                    string mangledName = match.Groups[1].Value;
+                    if (mangledName.Contains($"swiftFunc{numMangledNamesFound}"))
+                    {
+                        string swiftLoweringParams = match.Groups[2].Value;
+                        if (swiftLoweringParams.Contains("dereferenceable"))
+                        {
+                            swiftLowerings.Add(null);
+                        }
+                        else
+                        {
+                            string[] swiftLowering = swiftLoweringParams.Split(',').Select(s => s.Trim()).Select(s => s.Split(' ')[0]).ToArray();
+                            swiftLowerings.Add(swiftLowering);
+                        }
+
+                        numMangledNamesFound++;
+                    }
                 }
+
+                StringBuilder csharp = new StringBuilder();
+                Dictionary<string, string> llvmToLowered = new Dictionary<string, string>
+                {
+                    ["i8"] = "ExpectedLoweringAttribute.Lowered.Int8",
+                    ["i16"] = "ExpectedLoweringAttribute.Lowered.Int16",
+                    ["i32"] = "ExpectedLoweringAttribute.Lowered.Int32",
+                    ["i64"] = "ExpectedLoweringAttribute.Lowered.Int64",
+                    ["float"] = "ExpectedLoweringAttribute.Lowered.Float",
+                    ["double"] = "ExpectedLoweringAttribute.Lowered.Double",
+                };
+
+                for (int i = 0; i < numFunctions; i++)
+                {
+                    string[]? swiftLowering = swiftLowerings[i];
+                    if (swiftLowering == null)
+                    {
+                        string expectedLoweringAttribute = "[ExpectedLowering] // By reference";
+                        paramTypes[i][0].GenerateCSharp(csharp, expectedLoweringAttribute, false);
+                    }
+                    else
+                    {
+                        string expectedLoweringAttribute =
+                            "[ExpectedLowering(" +
+                            string.Join(", ", swiftLowering.Select(t => llvmToLowered[t])) +
+                            ")]";
+
+                        paramTypes[i][0].GenerateCSharp(csharp, expectedLoweringAttribute, false);
+                    }
+                }
+
+                File.WriteAllText("/Users/jakobbotsch/dev/dotnet/runtime/src/tests/Interop/Swift/SwiftAbiStress/SwiftAbiStress.cs", csharp.ToString());
             }
-
-            Console.WriteLine("Found {0} mangled names", numMangledNamesFound);
-            Trace.Assert(mangledNames.Count == numFunctions && paramTypes.Count == numFunctions);
-
-            StringBuilder csharp = new();
-            csharp.AppendLine("using System;");
-            csharp.AppendLine("using System.Runtime.CompilerServices;");
-            csharp.AppendLine("using System.Runtime.InteropServices;");
-            csharp.AppendLine("using System.Runtime.InteropServices.Swift;");
-            csharp.AppendLine("using Xunit;");
-            csharp.AppendLine("");
-            csharp.AppendLine("public class SwiftAbiStress");
-            csharp.AppendLine("{");
-            csharp.AppendLine("    private const string SwiftLib = \"libSwiftAbiStress.dylib\";");
-            csharp.AppendLine("");
-
-            for (int i = 0; i < numFunctions; i++)
+            else
             {
-                List<InteropType> types = paramTypes[i];
-                string mangledName = mangledNames[i];
+                Invoke("bash", "/Users/jakobbotsch/dev/dotnet/runtime", ["src/tests/build.sh", "-tree:Interop/Swift", "-checked"], true, null);
+                Console.WriteLine("---------- Getting mangled names -----------");
+                string nmOutput = Invoke("nm", "/Users/jakobbotsch/dev/dotnet/runtime/artifacts/tests/coreclr/osx.arm64.Checked/Interop/Swift/SwiftAbiStress/SwiftAbiStress", ["-gU", "libSwiftAbiStress.dylib"], true, null);
 
-                foreach (InteropType paramType in types)
+                List<string> mangledNames = new();
+                int numMangledNamesFound = 0;
+                foreach (string line in nmOutput.ReplaceLineEndings().Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries))
                 {
-                    paramType.GenerateCSharp(csharp);
+                    string mangledName = line.Split(' ')[2];
+                    mangledName = mangledName.TrimStart('_');
+                    if (mangledName.Contains($"swiftFunc{numMangledNamesFound}"))
+                    {
+                        mangledNames.Add(mangledName);
+                        numMangledNamesFound++;
+                    }
                 }
 
-                csharp.AppendLine("    [UnmanagedCallConv(CallConvs = new Type[] { typeof(CallConvSwift) })]");
-                csharp.AppendLine($"    [DllImport(SwiftLib, EntryPoint = \"{mangledName}\")]");
-                csharp.Append($"    private static extern nint SwiftFunc{i}(");
-                csharp.AppendJoin(", ", types.Select((t, i) => $"{t.GenerateCSharpUse()} a{i}"));
-                csharp.AppendLine(");");
+                Console.WriteLine("Found {0} mangled names", numMangledNamesFound);
+                Trace.Assert(mangledNames.Count == numFunctions && paramTypes.Count == numFunctions);
+
+                StringBuilder csharp = new();
+                csharp.AppendLine("using System;");
+                csharp.AppendLine("using System.Runtime.CompilerServices;");
+                csharp.AppendLine("using System.Runtime.InteropServices;");
+                csharp.AppendLine("using System.Runtime.InteropServices.Swift;");
+                csharp.AppendLine("using Xunit;");
                 csharp.AppendLine("");
-                csharp.AppendLine("    [Fact]");
-                csharp.AppendLine($"    public static void TestSwiftFunc{i}()");
-                csharp.AppendLine("    {");
+                csharp.AppendLine("public class SwiftAbiStress");
+                csharp.AppendLine("{");
+                csharp.AppendLine("    private const string SwiftLib = \"libSwiftAbiStress.dylib\";");
+                csharp.AppendLine("");
 
-                Fnv1aHasher expectedHash = new();
-                csharp.AppendLine($"        Console.Write(\"Running SwiftFunc{i}: \");");
-                csharp.Append($"        long result = SwiftFunc{i}(");
-                for (int j = 0; j < types.Count; j++)
+                for (int i = 0; i < numFunctions; i++)
                 {
-                    if (j > 0)
-                        csharp.Append(", ");
+                    List<InteropType> types = paramTypes[i];
+                    string mangledName = mangledNames[i];
 
-                    types[j].GenerateCSharpValueAndHash(csharp, ref expectedHash, rand);
+                    foreach (InteropType paramType in types)
+                    {
+                        paramType.GenerateCSharp(csharp, "", true);
+                    }
+
+                    csharp.AppendLine("    [UnmanagedCallConv(CallConvs = new Type[] { typeof(CallConvSwift) })]");
+                    csharp.AppendLine($"    [DllImport(SwiftLib, EntryPoint = \"{mangledName}\")]");
+                    csharp.Append($"    private static extern nint SwiftFunc{i}(");
+                    csharp.AppendJoin(", ", types.Select((t, i) => $"{t.GenerateCSharpUse()} a{i}"));
+                    csharp.AppendLine(");");
+                    csharp.AppendLine("");
+                    csharp.AppendLine("    [Fact]");
+                    csharp.AppendLine($"    public static void TestSwiftFunc{i}()");
+                    csharp.AppendLine("    {");
+
+                    Fnv1aHasher expectedHash = new();
+                    csharp.AppendLine($"        Console.Write(\"Running SwiftFunc{i}: \");");
+                    csharp.Append($"        long result = SwiftFunc{i}(");
+                    for (int j = 0; j < types.Count; j++)
+                    {
+                        if (j > 0)
+                            csharp.Append(", ");
+
+                        types[j].GenerateCSharpValueAndHash(csharp, ref expectedHash, rand);
+                    }
+
+                    csharp.AppendLine(");");
+                    csharp.AppendLine($"        Assert.Equal({expectedHash.Finalize()}, result);");
+                    csharp.AppendLine($"        Console.WriteLine(\"OK\");");
+                    csharp.AppendLine("    }");
+                    csharp.AppendLine("");
                 }
 
-                csharp.AppendLine(");");
-                csharp.AppendLine($"        Assert.Equal({expectedHash.Finalize()}, result);");
-                csharp.AppendLine($"        Console.WriteLine(\"OK\");");
-                csharp.AppendLine("    }");
-                csharp.AppendLine("");
+                csharp.AppendLine("}");
+                File.WriteAllText("/Users/jakobbotsch/dev/dotnet/runtime/src/tests/Interop/Swift/SwiftAbiStress/SwiftAbiStress.cs", csharp.ToString());
+
+                Invoke("bash", "/Users/jakobbotsch/dev/dotnet/runtime", ["src/tests/build.sh", "-tree:Interop/Swift", "-checked"], true, null);
             }
-
-            csharp.AppendLine("}");
-            File.WriteAllText("/Users/jakobbotsch/dev/dotnet/runtime/src/tests/Interop/Swift/SwiftAbiStress/SwiftAbiStress.cs", csharp.ToString());
-
-            Invoke("bash", "/Users/jakobbotsch/dev/dotnet/runtime", ["src/tests/build.sh", "-tree:Interop/Swift", "-checked"], true, null);
         }
 
         private static readonly PrimitiveInteropType[] s_primitiveInteropTypes = [
@@ -301,7 +374,7 @@ stderr:
         private abstract class InteropType
         {
             public abstract void GenerateSwift(StringBuilder sb);
-            public abstract void GenerateCSharp(StringBuilder sb);
+            public abstract void GenerateCSharp(StringBuilder sb, string extraAttribute, bool ctor);
             public abstract string GenerateSwiftUse();
             public abstract string GenerateCSharpUse();
             public abstract void GenerateCSharpValueAndHash(StringBuilder sb, ref Fnv1aHasher hasher, Random rand);
@@ -324,7 +397,7 @@ stderr:
                 Size = size;
             }
 
-            public override void GenerateCSharp(StringBuilder sb)
+            public override void GenerateCSharp(StringBuilder sb, string extraAttribute, bool ctor)
             {
             }
 
@@ -450,14 +523,18 @@ stderr:
                 (Size, Alignment) = ComputeSizeAlignment();
             }
 
-            public override void GenerateCSharp(StringBuilder sb)
+            public override void GenerateCSharp(StringBuilder sb, string extraAttribute, bool ctor)
             {
                 foreach (InteropType field in _fields)
                 {
-                    field.GenerateCSharp(sb);
+                    field.GenerateCSharp(sb, "", ctor);
                 }
 
                 sb.AppendLine($"    [StructLayout(LayoutKind.Sequential, Size = {Size})]");
+                if (!string.IsNullOrWhiteSpace(extraAttribute))
+                {
+                    sb.AppendLine($"    {extraAttribute}");
+                }
                 sb.AppendLine($"    struct {_name}");
                 sb.AppendLine("    {");
                 for (int i = 0; i < _fields.Length; i++)
@@ -465,22 +542,26 @@ stderr:
                     sb.AppendLine($"        public {_fields[i].GenerateCSharpUse()} F{i};");
                 }
 
-                sb.AppendLine("");
-                sb.Append($"        public {_name}(");
-                for (int i = 0; i < _fields.Length; i++)
+                if (ctor)
                 {
-                    if (i > 0)
-                        sb.Append(", ");
+                    sb.AppendLine("");
+                    sb.Append($"        public {_name}(");
+                    for (int i = 0; i < _fields.Length; i++)
+                    {
+                        if (i > 0)
+                            sb.Append(", ");
 
-                    sb.Append($"{_fields[i].GenerateCSharpUse()} f{i}");
+                        sb.Append($"{_fields[i].GenerateCSharpUse()} f{i}");
+                    }
+                    sb.AppendLine(")");
+                    sb.AppendLine("        {");
+                    for (int i = 0; i < _fields.Length; i++)
+                    {
+                        sb.AppendLine($"            F{i} = f{i};");
+                    }
+                    sb.AppendLine("        }");
                 }
-                sb.AppendLine(")");
-                sb.AppendLine("        {");
-                for (int i = 0; i < _fields.Length; i++)
-                {
-                    sb.AppendLine($"            F{i} = f{i};");
-                }
-                sb.AppendLine("        }");
+
                 sb.AppendLine("    }");
                 sb.AppendLine("");
             }
