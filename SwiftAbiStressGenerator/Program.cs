@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Globalization;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -12,69 +13,97 @@ namespace SwiftAbiStressGenerator
         {
             if (args.Length < 2)
             {
-                Console.WriteLine("Usage: SwiftAbiStressGenerator <num functions> <max parameters> [--gen-lowering-tests]");
+                Console.WriteLine("Usage: SwiftAbiStressGenerator <num functions> <max parameters|max ret fields> [--gen-return-tests] [--gen-lowering-tests]");
                 return;
             }
 
             int numFunctions = int.Parse(args[0]);
-            int maxParameters = int.Parse(args[1]);
+            int maxParametersOrFields = int.Parse(args[1]);
+            bool genReturnTests = args.Contains("--gen-return-tests");
             bool genLoweringTests = args.Contains("--gen-lowering-tests");
+            bool genParamTests = !genReturnTests && !genLoweringTests;
 
             Random rand = new Random(1234);
 
             StringBuilder swift = new();
+            StringWriter swiftWriter = new StringWriter(swift);
             swift.AppendLine("import Foundation");
             swift.AppendLine("");
-            swift.AppendLine("struct HasherFNV1a {");
-            swift.AppendLine("");
-            swift.AppendLine("    private var hash: UInt = 14_695_981_039_346_656_037");
-            swift.AppendLine("    private let prime: UInt = 1_099_511_628_211");
-            swift.AppendLine("");
-            swift.AppendLine("    mutating func combine<T>(_ val: T) {");
-            swift.AppendLine("        for byte in withUnsafeBytes(of: val, Array.init) {");
-            swift.AppendLine("            hash ^= UInt(byte)");
-            swift.AppendLine("            hash = hash &* prime");
-            swift.AppendLine("        }");
-            swift.AppendLine("    }");
-            swift.AppendLine("");
-            swift.AppendLine("    func finalize() -> Int {");
-            swift.AppendLine("        Int(truncatingIfNeeded: hash)");
-            swift.AppendLine("    }");
-            swift.AppendLine("}");
-            swift.AppendLine("");
 
-            List<List<InteropType>> paramTypes = new();
-
-            for (int i = 0; i < numFunctions; i++)
+            if (genParamTests)
             {
-                int numParams = rand.Next(1, maxParameters + 1);
-                if (genLoweringTests)
-                {
-                    paramTypes.Add(new List<InteropType> { GenStructType(rand, numParams, $"F{i}_S") });
-                }
-                else
-                {
-                    paramTypes.Add(GenParameterTypes(rand, numParams, $"F{i}"));
-                }
-
-                foreach (InteropType paramType in paramTypes.Last())
-                {
-                    paramType.GenerateSwift(swift);
-                }
-
-                swift.Append($"public func swiftFunc{i}(");
-
-                swift.AppendJoin(", ", paramTypes.Last().Select((t, i) => $"a{i}: {t.GenerateSwiftUse()}"));
-
-                swift.AppendLine(") -> Int {");
-                swift.AppendLine("    var hasher = HasherFNV1a()");
-                for (int j = 0; j < paramTypes.Last().Count; j++)
-                {
-                    paramTypes.Last()[j].GenerateSwiftHashCombine(swift, $"a{j}");
-                }
-                swift.AppendLine("    return hasher.finalize()");
+                swift.AppendLine("struct HasherFNV1a {");
+                swift.AppendLine("");
+                swift.AppendLine("    private var hash: UInt = 14_695_981_039_346_656_037");
+                swift.AppendLine("    private let prime: UInt = 1_099_511_628_211");
+                swift.AppendLine("");
+                swift.AppendLine("    mutating func combine<T>(_ val: T) {");
+                swift.AppendLine("        for byte in withUnsafeBytes(of: val, Array.init) {");
+                swift.AppendLine("            hash ^= UInt(byte)");
+                swift.AppendLine("            hash = hash &* prime");
+                swift.AppendLine("        }");
+                swift.AppendLine("    }");
+                swift.AppendLine("");
+                swift.AppendLine("    func finalize() -> Int {");
+                swift.AppendLine("        Int(truncatingIfNeeded: hash)");
+                swift.AppendLine("    }");
                 swift.AppendLine("}");
                 swift.AppendLine("");
+            }
+
+            List<List<InteropType>> paramTypes = new();
+            List<InteropType> retTypes = new();
+
+            if (genParamTests || genLoweringTests)
+            {
+                for (int i = 0; i < numFunctions; i++)
+                {
+                    int numParams = rand.Next(1, maxParametersOrFields + 1);
+                    if (genLoweringTests)
+                    {
+                        paramTypes.Add(new List<InteropType> { GenStructType(rand, numParams, $"F{i}_S") });
+                    }
+                    else
+                    {
+                        paramTypes.Add(GenParameterTypes(rand, numParams, $"F{i}"));
+                    }
+
+                    foreach (InteropType paramType in paramTypes.Last())
+                    {
+                        paramType.GenerateSwift(swift);
+                    }
+
+                    swift.Append($"public func swiftFunc{i}(");
+
+                    swift.AppendJoin(", ", paramTypes.Last().Select((t, i) => $"a{i}: {t.GenerateSwiftUse()}"));
+
+                    swift.AppendLine(") -> Int {");
+                    swift.AppendLine("    var hasher = HasherFNV1a()");
+                    for (int j = 0; j < paramTypes.Last().Count; j++)
+                    {
+                        paramTypes.Last()[j].GenerateSwiftHashCombine(swift, $"a{j}");
+                    }
+                    swift.AppendLine("    return hasher.finalize()");
+                    swift.AppendLine("}");
+                    swift.AppendLine("");
+                }
+            }
+            else
+            {
+                for (int i = 0; i < numFunctions; i++)
+                {
+                    int numFields = rand.Next(1, maxParametersOrFields + 1);
+                    retTypes.Add(GenStructType(rand, numFields, $"S{i}"));
+
+                    retTypes.Last().GenerateSwift(swift);
+                    swift.AppendLine($"public func swiftFunc{i}() -> S{i} {{");
+                    swift.Append("    return ");
+                    Fnv1aHasher hasher = new();
+                    Random retTestRand = CreateRandForRetTest(i);
+                    retTypes.Last().GenerateValuesAndHash(TextWriter.Null, swiftWriter, ref hasher, retTestRand);
+                    swift.AppendLine("}");
+                    swift.AppendLine("");
+                }
             }
 
             File.WriteAllText("/Users/jakobbotsch/dev/dotnet/runtime/src/tests/Interop/Swift/SwiftAbiStress/SwiftAbiStress.swift", swift.ToString());
@@ -160,9 +189,10 @@ namespace SwiftAbiStressGenerator
                 }
 
                 Console.WriteLine("Found {0} mangled names", numMangledNamesFound);
-                Trace.Assert(mangledNames.Count == numFunctions && paramTypes.Count == numFunctions);
+                Trace.Assert(mangledNames.Count == numFunctions);
 
                 StringBuilder csharp = new();
+                StringWriter csharpWriter = new StringWriter(csharp);
                 csharp.AppendLine("using System;");
                 csharp.AppendLine("using System.Runtime.CompilerServices;");
                 csharp.AppendLine("using System.Runtime.InteropServices;");
@@ -176,40 +206,67 @@ namespace SwiftAbiStressGenerator
 
                 for (int i = 0; i < numFunctions; i++)
                 {
-                    List<InteropType> types = paramTypes[i];
+                    List<InteropType> types = genParamTests ? paramTypes[i] : null;
+                    InteropType retType = genReturnTests ? retTypes[i] : null;
                     string mangledName = mangledNames[i];
 
-                    foreach (InteropType paramType in types)
+                    if (genParamTests)
                     {
-                        paramType.GenerateCSharp(csharp, "", true);
+                        foreach (InteropType paramType in types)
+                        {
+                            paramType.GenerateCSharp(csharp, "", true);
+                        }
+                    }
+                    else
+                    {
+                        retTypes[i].GenerateCSharp(csharp, "", true);
                     }
 
                     csharp.AppendLine("    [UnmanagedCallConv(CallConvs = new Type[] { typeof(CallConvSwift) })]");
                     csharp.AppendLine($"    [DllImport(SwiftLib, EntryPoint = \"{mangledName}\")]");
-                    csharp.Append($"    private static extern nint SwiftFunc{i}(");
-                    csharp.AppendJoin(", ", types.Select((t, i) => $"{t.GenerateCSharpUse()} a{i}"));
-                    csharp.AppendLine(");");
-                    csharp.AppendLine("");
-                    csharp.AppendLine("    [Fact]");
-                    csharp.AppendLine($"    public static void TestSwiftFunc{i}()");
-                    csharp.AppendLine("    {");
-
-                    Fnv1aHasher expectedHash = new();
-                    csharp.AppendLine($"        Console.Write(\"Running SwiftFunc{i}: \");");
-                    csharp.Append($"        long result = SwiftFunc{i}(");
-                    for (int j = 0; j < types.Count; j++)
+                    if (genParamTests)
                     {
-                        if (j > 0)
-                            csharp.Append(", ");
+                        csharp.Append($"    private static extern nint SwiftFunc{i}(");
+                        csharp.AppendJoin(", ", types.Select((t, i) => $"{t.GenerateCSharpUse()} a{i}"));
+                        csharp.AppendLine(");");
+                        csharp.AppendLine("");
+                        csharp.AppendLine("    [Fact]");
+                        csharp.AppendLine($"    public static void TestSwiftFunc{i}()");
+                        csharp.AppendLine("    {");
 
-                        types[j].GenerateCSharpValueAndHash(csharp, ref expectedHash, rand);
+                        Fnv1aHasher expectedHash = new();
+                        csharp.AppendLine($"        Console.Write(\"Running SwiftFunc{i}: \");");
+                        csharp.Append($"        long result = SwiftFunc{i}(");
+                        for (int j = 0; j < types.Count; j++)
+                        {
+                            if (j > 0)
+                                csharp.Append(", ");
+
+                            types[j].GenerateValuesAndHash(csharpWriter, TextWriter.Null, ref expectedHash, rand);
+                        }
+
+                        csharp.AppendLine(");");
+                        csharp.AppendLine($"        Assert.Equal({expectedHash.Finalize()}, result);");
+                        csharp.AppendLine($"        Console.WriteLine(\"OK\");");
+                        csharp.AppendLine("    }");
+                        csharp.AppendLine("");
                     }
-
-                    csharp.AppendLine(");");
-                    csharp.AppendLine($"        Assert.Equal({expectedHash.Finalize()}, result);");
-                    csharp.AppendLine($"        Console.WriteLine(\"OK\");");
-                    csharp.AppendLine("    }");
-                    csharp.AppendLine("");
+                    else
+                    {
+                        csharp.AppendLine($"    private static extern S{i} SwiftFunc{i}();");
+                        csharp.AppendLine("");
+                        csharp.AppendLine("    [Fact]");
+                        csharp.AppendLine($"    public static void TestSwiftFunc{i}()");
+                        csharp.AppendLine("    {");
+                        csharp.AppendLine($"        S{i} val = SwiftFunc{i}();");
+                        csharp.Append($"        Assert.Equal(");
+                        Random retTestRand = CreateRandForRetTest(i);
+                        Fnv1aHasher hasher = new();
+                        retTypes[i].GenerateValuesAndHash(csharpWriter, TextWriter.Null, ref hasher, retTestRand);
+                        csharp.AppendLine($", val);");
+                        csharp.AppendLine("    }");
+                        csharp.AppendLine("");
+                    }
                 }
 
                 csharp.AppendLine("}");
@@ -217,6 +274,12 @@ namespace SwiftAbiStressGenerator
 
                 Invoke("bash", "/Users/jakobbotsch/dev/dotnet/runtime", ["src/tests/build.sh", "-tree:Interop/Swift", "-checked"], true, null);
             }
+        }
+
+        private static Random CreateRandForRetTest(int index)
+        {
+            Random retTestRand = new Random(unchecked((int)0xdeadbeef * index + 0x1234));
+            return retTestRand;
         }
 
         private static readonly PrimitiveInteropType[] s_primitiveInteropTypes = [
@@ -377,7 +440,7 @@ stderr:
             public abstract void GenerateCSharp(StringBuilder sb, string extraAttribute, bool ctor);
             public abstract string GenerateSwiftUse();
             public abstract string GenerateCSharpUse();
-            public abstract void GenerateCSharpValueAndHash(StringBuilder sb, ref Fnv1aHasher hasher, Random rand);
+            public abstract void GenerateValuesAndHash(TextWriter csharp, TextWriter swift, ref Fnv1aHasher hasher, Random rand);
             public abstract void GenerateSwiftHashCombine(StringBuilder sb, string valueName);
             public abstract int Size { get; }
             public abstract int Alignment { get; }
@@ -408,7 +471,7 @@ stderr:
             public override string GenerateCSharpUse() => CSharpType;
             public override string GenerateSwiftUse() => SwiftType;
 
-            public override void GenerateCSharpValueAndHash(StringBuilder sb, ref Fnv1aHasher hasher, Random rand)
+            public override void GenerateValuesAndHash(TextWriter csharp, TextWriter swift, ref Fnv1aHasher hasher, Random rand)
             {
                 switch (CSharpType)
                 {
@@ -416,84 +479,96 @@ stderr:
                         {
                             nint value = (nint)rand.NextInt64();
                             hasher.Combine(value);
-                            sb.AppendFormat($"unchecked((nint){value})");
+                            csharp.Write($"unchecked((nint){value})");
+                            swift.Write(value);
                             break;
                         }
                     case "nuint":
                         {
                             nuint value = (nuint)rand.NextInt64();
                             hasher.Combine(value);
-                            sb.AppendFormat($"unchecked((nuint){value})");
+                            csharp.Write($"unchecked((nuint){value})");
+                            swift.Write(value);
                             break;
                         }
                     case "sbyte":
                         {
                             sbyte value = checked((sbyte)rand.Next(sbyte.MinValue, sbyte.MaxValue + 1));
                             hasher.Combine(value);
-                            sb.Append(value);
+                            csharp.Write(value);
+                            swift.Write(value);
                             break;
                         }
                     case "short":
                         {
                             short value = checked((short)rand.Next(short.MinValue, short.MaxValue + 1));
                             hasher.Combine(value);
-                            sb.Append(value);
+                            csharp.Write(value);
+                            swift.Write(value);
                             break;
                         }
                     case "int":
                         {
                             int value = rand.Next();
                             hasher.Combine(value);
-                            sb.Append(value);
+                            csharp.Write(value);
+                            swift.Write(value);
                             break;
                         }
                     case "long":
                         {
                             long value = rand.NextInt64();
                             hasher.Combine(value);
-                            sb.Append(value);
+                            csharp.Write(value);
+                            swift.Write(value);
                             break;
                         }
                     case "byte":
                         {
                             byte value = checked((byte)rand.Next(byte.MinValue, byte.MaxValue + 1));
                             hasher.Combine(value);
-                            sb.Append(value);
+                            csharp.Write(value);
+                            swift.Write(value);
                             break;
                         }
                     case "ushort":
                         {
                             ushort value = checked((ushort)rand.Next(ushort.MinValue, ushort.MaxValue + 1));
                             hasher.Combine(value);
-                            sb.Append(value);
+                            csharp.Write(value);
+                            swift.Write(value);
                             break;
                         }
                     case "uint":
                         {
                             uint value = (uint)rand.Next();
                             hasher.Combine(value);
-                            sb.Append(value);
+                            csharp.Write(value);
+                            swift.Write(value);
                             break;
                         }
                     case "ulong":
                         {
                             ulong value = (ulong)rand.NextInt64();
                             hasher.Combine(value);
-                            sb.Append(value);
+                            csharp.Write(value);
+                            swift.Write(value);
                             break;
                         }
                     case "float":
                         {
                             float value = rand.Next(1 << 23);
                             hasher.Combine(value);
-                            sb.Append(value);
+                            csharp.Write(value);
+                            swift.Write(value);
                             break;
                         }
                     case "double":
                         {
                             double value = rand.NextInt64(1L << 52);
                             hasher.Combine(value);
-                            sb.Append(value);
+                            csharp.Write(value);
+                            swift.Write(value);
                             break;
                         }
                     default:
@@ -589,19 +664,26 @@ stderr:
 
             public override string GenerateSwiftUse() => _name;
 
-            public override void GenerateCSharpValueAndHash(StringBuilder sb, ref Fnv1aHasher hasher, Random rand)
+            public override void GenerateValuesAndHash(TextWriter csharp, TextWriter swift, ref Fnv1aHasher hasher, Random rand)
             {
-                sb.Append($"new {_name}(");
+                csharp.Write($"new {_name}(");
+                swift.Write($"{_name}(");
 
                 for (int i = 0; i < _fields.Length; i++)
                 {
                     if (i > 0)
-                        sb.Append(", ");
+                    {
+                        csharp.Write(", ");
+                        swift.Write(", ");
+                    }
 
-                    _fields[i].GenerateCSharpValueAndHash(sb, ref hasher, rand);
+                    swift.Write($"f{i}: ");
+
+                    _fields[i].GenerateValuesAndHash(csharp, swift, ref hasher, rand);
                 }
 
-                sb.Append(")");
+                csharp.Write(")");
+                swift.Write(")");
             }
 
             public override void GenerateSwiftHashCombine(StringBuilder sb, string valueName)
