@@ -13,7 +13,7 @@ namespace SwiftAbiStressGenerator
         {
             if (args.Length < 2)
             {
-                Console.WriteLine("Usage: SwiftAbiStressGenerator <num functions> <max parameters|max ret fields> [--gen-return-tests] [--gen-lowering-tests]");
+                Console.WriteLine("Usage: SwiftAbiStressGenerator <num functions> <max parameters|max ret fields> [--gen-return-tests] [--gen-lowering-tests] [--reverse-pinvoke]");
                 return;
             }
 
@@ -21,7 +21,8 @@ namespace SwiftAbiStressGenerator
             int maxParametersOrFields = int.Parse(args[1]);
             bool genReturnTests = args.Contains("--gen-return-tests");
             bool genLoweringTests = args.Contains("--gen-lowering-tests");
-            bool genParamTests = !genReturnTests && !genLoweringTests;
+            bool genReversePinvoke = args.Contains("--reverse-pinvoke");
+            bool genParamTests = !genReturnTests && !genLoweringTests && !genReversePinvoke;
 
             Random rand = new Random(1234);
 
@@ -51,46 +52,89 @@ namespace SwiftAbiStressGenerator
                 swift.AppendLine("");
             }
 
-            string testName = genReturnTests ? "SwiftRetAbiStress" : "SwiftAbiStress";
-            string swiftFuncNamePrefix = genReturnTests ? "swiftRetFunc" : "swiftFunc";
-            string csharpFuncNamePrefix = genReturnTests ? "SwiftRetFunc" : "SwiftFunc";
-            string mangledNamePrefix = genReturnTests ? "Func" : "swiftFunc"; // weird substitution stuff in their mangling means we can't use "swiftRetFunc"...
+            (string testName, string swiftFuncNamePrefix, string csharpFuncNamePrefix, string mangledNamePrefix) =
+                genReturnTests ? ("SwiftRetAbiStress", "swiftRetFunc", "SwiftRetFunc", "Func") : // weird substitution stuff in their mangling means we can't use "swiftRetFunc"...
+                genReversePinvoke ? ("SwiftCallbackAbiStress", "swiftCallbackFunc", "SwiftCallbackFunc", "Func") :
+                                    ("SwiftAbiStress", "swiftFunc", "SwiftFunc", "swiftFunc");
 
-            List<List<InteropType>> paramTypes = new();
+            List<List<InteropType>> funcParamTypes = new();
             List<InteropType> retTypes = new();
 
-            if (genParamTests || genLoweringTests)
+            if (genParamTests || genLoweringTests || genReversePinvoke)
             {
                 for (int i = 0; i < numFunctions; i++)
                 {
                     int numParams = rand.Next(1, maxParametersOrFields + 1);
                     if (genLoweringTests)
                     {
-                        paramTypes.Add(new List<InteropType> { GenStructType(rand, numParams, $"F{i}_S") });
+                        funcParamTypes.Add(new List<InteropType> { GenStructType(rand, numParams, $"F{i}_S") });
                     }
                     else
                     {
-                        paramTypes.Add(GenParameterTypes(rand, numParams, $"F{i}"));
+                        funcParamTypes.Add(GenParameterTypes(rand, numParams, $"F{i}"));
                     }
 
-                    foreach (InteropType paramType in paramTypes.Last())
+                    if (genReversePinvoke)
+                    {
+                        if (rand.NextDouble() < 0.5)
+                        {
+                            retTypes.Add(s_primitiveInteropTypes[rand.Next(s_primitiveInteropTypes.Length)]);
+                        }
+                        else
+                        {
+                            retTypes.Add(GenStructType(rand, 7, $"F{i}_Ret"));
+                        }
+                    }
+                    else
+                    {
+                        retTypes.Add(s_primitiveInteropTypes.First());
+                    }
+
+                    foreach (InteropType paramType in funcParamTypes.Last())
                     {
                         paramType.GenerateSwift(swift);
                     }
 
-                    swift.Append($"public func {swiftFuncNamePrefix}{i}(");
-
-                    swift.AppendJoin(", ", paramTypes.Last().Select((t, i) => $"a{i}: {t.GenerateSwiftUse()}"));
-
-                    swift.AppendLine(") -> Int {");
-                    swift.AppendLine("    var hasher = HasherFNV1a()");
-                    for (int j = 0; j < paramTypes.Last().Count; j++)
+                    if (genReversePinvoke)
                     {
-                        paramTypes.Last()[j].GenerateSwiftHashCombine(swift, $"a{j}");
+                        retTypes.Last()!.GenerateSwift(swift);
+
+                        swift.Append($"public func {swiftFuncNamePrefix}{i}(f: (");
+                        swift.AppendJoin(", ", funcParamTypes.Last()!.Select((t, i) => t.GenerateSwiftUse()));
+                        swift.AppendLine($") -> {retTypes.Last()!.GenerateSwiftUse()}) -> {retTypes.Last().GenerateSwiftUse()} {{");
+
+                        Fnv1aHasher hasher = new();
+                        Random reverseRand = CreateRandForTest(i);
+                        swift.Append("    return f(");
+                        bool first = true;
+                        foreach (InteropType paramType in funcParamTypes.Last())
+                        {
+                            if (!first)
+                                swift.Append(", ");
+
+                            paramType.GenerateValuesAndHash(TextWriter.Null, swiftWriter, ref hasher, reverseRand);
+                            first = false;
+                        }
+                        swift.AppendLine(")");
+                        swift.AppendLine("}");
+                        swift.AppendLine("");
                     }
-                    swift.AppendLine("    return hasher.finalize()");
-                    swift.AppendLine("}");
-                    swift.AppendLine("");
+                    else
+                    {
+                        swift.Append($"public func {swiftFuncNamePrefix}{i}(");
+
+                        swift.AppendJoin(", ", funcParamTypes.Last().Select((t, i) => $"a{i}: {t.GenerateSwiftUse()}"));
+
+                        swift.AppendLine(") -> Int {");
+                        swift.AppendLine("    var hasher = HasherFNV1a()");
+                        for (int j = 0; j < funcParamTypes.Last().Count; j++)
+                        {
+                            funcParamTypes.Last()[j].GenerateSwiftHashCombine(swift, $"a{j}");
+                        }
+                        swift.AppendLine("    return hasher.finalize()");
+                        swift.AppendLine("}");
+                        swift.AppendLine("");
+                    }
                 }
             }
             else
@@ -99,12 +143,13 @@ namespace SwiftAbiStressGenerator
                 {
                     int numFields = rand.Next(1, maxParametersOrFields + 1);
                     retTypes.Add(GenStructType(rand, numFields, $"S{i}"));
+                    funcParamTypes.Add([]);
 
                     retTypes.Last().GenerateSwift(swift);
                     swift.AppendLine($"public func {swiftFuncNamePrefix}{i}() -> S{i} {{");
                     swift.Append("    return ");
                     Fnv1aHasher hasher = new();
-                    Random retTestRand = CreateRandForRetTest(i);
+                    Random retTestRand = CreateRandForTest(i);
                     retTypes.Last().GenerateValuesAndHash(TextWriter.Null, swiftWriter, ref hasher, retTestRand);
                     swift.AppendLine("");
                     swift.AppendLine("}");
@@ -160,7 +205,7 @@ namespace SwiftAbiStressGenerator
                     if (swiftLowering == null)
                     {
                         string expectedLoweringAttribute = "[ExpectedLowering] // By reference";
-                        paramTypes[i][0].GenerateCSharp(csharp, expectedLoweringAttribute, false);
+                        funcParamTypes[i][0].GenerateCSharp(csharp, expectedLoweringAttribute, false);
                     }
                     else
                     {
@@ -169,7 +214,7 @@ namespace SwiftAbiStressGenerator
                             string.Join(", ", swiftLowering.Select(t => llvmToLowered[t])) +
                             ")]";
 
-                        paramTypes[i][0].GenerateCSharp(csharp, expectedLoweringAttribute, false);
+                        funcParamTypes[i][0].GenerateCSharp(csharp, expectedLoweringAttribute, false);
                     }
                 }
 
@@ -199,31 +244,43 @@ namespace SwiftAbiStressGenerator
 
                 StringBuilder csharp = new();
                 StringWriter csharpWriter = new StringWriter(csharp);
+
+                if (genReversePinvoke)
+                {
+                    csharp.AppendLine("#pragma warning disable CS8500");
+                    csharp.AppendLine("");
+                }
+
                 csharp.AppendLine("using System;");
                 csharp.AppendLine("using System.Runtime.CompilerServices;");
+                if (genReversePinvoke)
+                {
+                    csharp.AppendLine("using System.Runtime.ExceptionServices;");
+                }
                 csharp.AppendLine("using System.Runtime.InteropServices;");
                 csharp.AppendLine("using System.Runtime.InteropServices.Swift;");
                 csharp.AppendLine("using Xunit;");
                 csharp.AppendLine("");
-                csharp.AppendLine($"public class {testName}");
+                csharp.AppendLine($"public unsafe class {testName}");
                 csharp.AppendLine("{");
                 csharp.AppendLine($"    private const string SwiftLib = \"lib{testName}.dylib\";");
                 csharp.AppendLine("");
 
                 for (int i = 0; i < numFunctions; i++)
                 {
-                    List<InteropType> types = genParamTests ? paramTypes[i] : null;
-                    InteropType retType = genReturnTests ? retTypes[i] : null;
+                    List<InteropType> paramTypes = funcParamTypes[i];
+                    InteropType retType = retTypes[i];
                     string mangledName = mangledNames[i];
 
-                    if (genParamTests)
+                    if (genParamTests || genReversePinvoke)
                     {
-                        foreach (InteropType paramType in types)
+                        foreach (InteropType paramType in paramTypes)
                         {
-                            paramType.GenerateCSharp(csharp, "", true);
+                            paramType.GenerateCSharp(csharp, "", genReturnTests);
                         }
                     }
-                    else
+
+                    if (genReturnTests || genReversePinvoke)
                     {
                         retTypes[i].GenerateCSharp(csharp, "", true);
                     }
@@ -233,7 +290,7 @@ namespace SwiftAbiStressGenerator
                     if (genParamTests)
                     {
                         csharp.Append($"    private static extern nint {csharpFuncNamePrefix}{i}(");
-                        csharp.AppendJoin(", ", types.Select((t, i) => $"{t.GenerateCSharpUse()} a{i}"));
+                        csharp.AppendJoin(", ", paramTypes.Select((t, i) => $"{t.GenerateCSharpUse()} a{i}"));
                         csharp.AppendLine(");");
                         csharp.AppendLine("");
                         csharp.AppendLine("    [Fact]");
@@ -243,12 +300,12 @@ namespace SwiftAbiStressGenerator
                         Fnv1aHasher expectedHash = new();
                         csharp.AppendLine($"        Console.Write(\"Running {csharpFuncNamePrefix}{i}: \");");
                         csharp.Append($"        long result = {csharpFuncNamePrefix}{i}(");
-                        for (int j = 0; j < types.Count; j++)
+                        for (int j = 0; j < paramTypes.Count; j++)
                         {
                             if (j > 0)
                                 csharp.Append(", ");
 
-                            types[j].GenerateValuesAndHash(csharpWriter, TextWriter.Null, ref expectedHash, rand);
+                            paramTypes[j].GenerateValuesAndHash(csharpWriter, TextWriter.Null, ref expectedHash, rand);
                         }
 
                         csharp.AppendLine(");");
@@ -257,17 +314,76 @@ namespace SwiftAbiStressGenerator
                         csharp.AppendLine("    }");
                         csharp.AppendLine("");
                     }
+                    else if (genReversePinvoke)
+                    {
+                        csharp.Append($"    private static extern {retType.GenerateCSharpUse()} {csharpFuncNamePrefix}{i}(delegate* unmanaged[Swift]<");
+                        csharp.AppendJoin(", ", paramTypes.Select((t, i) => t.GenerateCSharpUse()));
+                        if (paramTypes.Count > 0)
+                            csharp.Append(", ");
+                        csharp.Append("SwiftSelf, ");
+                        csharp.Append(retType.GenerateCSharpUse());
+                        csharp.AppendLine("> f, SwiftSelf self);");
+                        csharp.AppendLine("");
+                        csharp.AppendLine("    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvSwift)])]");
+                        csharp.Append($"    private static {retType.GenerateCSharpUse()} {csharpFuncNamePrefix}{i}Callback(");
+                        csharp.AppendJoin(", ", paramTypes.Select((t, i) => $"{t.GenerateCSharpUse()} a{i}"));
+                        if (paramTypes.Count > 0)
+                            csharp.Append(", ");
+                        csharp.AppendLine("SwiftSelf self)");
+                        csharp.AppendLine("    {");
+                        csharp.AppendLine("        try");
+                        csharp.AppendLine("        {");
+                        Random callbackRand = CreateRandForTest(i);
+                        for (int j = 0; j < paramTypes.Count; j++)
+                        {
+                            paramTypes[j].GenerateAssertEqual(csharpWriter, $"a{j}", callbackRand, "            ");
+                        }
+                        csharp.AppendLine("        }");
+                        csharp.AppendLine("        catch (Exception ex)");
+                        csharp.AppendLine("        {");
+                        csharp.AppendLine("            *(ExceptionDispatchInfo*)self.Value = ExceptionDispatchInfo.Capture(ex);");
+                        csharp.AppendLine("        }");
+                        csharp.AppendLine("");
+
+                        csharp.Append("        return ");
+                        var hasher = new Fnv1aHasher();
+                        retType.GenerateValuesAndHash(csharpWriter, TextWriter.Null, ref hasher, callbackRand);
+                        csharp.AppendLine(";");
+                        csharp.AppendLine("    }");
+                        csharp.AppendLine("");
+
+                        csharp.AppendLine("    [Fact]");
+                        csharp.AppendLine($"    public static void Test{csharpFuncNamePrefix}{i}()");
+                        csharp.AppendLine("    {");
+                        csharp.AppendLine($"        Console.Write(\"Running {csharpFuncNamePrefix}{i}: \");");
+                        csharp.AppendLine($"        ExceptionDispatchInfo ex = null;");
+                        csharp.AppendLine($"        {retType.GenerateCSharpUse()} val = {csharpFuncNamePrefix}{i}(&{csharpFuncNamePrefix}{i}Callback, new SwiftSelf(&ex));");
+                        csharp.AppendLine($"        if (ex != null)");
+                        csharp.AppendLine($"            ex.Throw();");
+                        csharp.AppendLine($"");
+
+                        callbackRand = CreateRandForTest(i);
+                        for (int j = 0; j < paramTypes.Count; j++)
+                        {
+                            paramTypes[j].GenerateValuesAndHash(TextWriter.Null, TextWriter.Null, ref hasher, callbackRand);
+                        }
+
+                        retType.GenerateAssertEqual(csharpWriter, "val", callbackRand, "        ");
+                        csharp.AppendLine($"        Console.WriteLine(\"OK\");");
+                        csharp.AppendLine("    }");
+                        csharp.AppendLine("");
+                    }
                     else
                     {
-                        csharp.AppendLine($"    private static extern S{i} {csharpFuncNamePrefix}{i}();");
+                        csharp.AppendLine($"    private static extern {retType.GenerateCSharpUse()} {csharpFuncNamePrefix}{i}();");
                         csharp.AppendLine("");
                         csharp.AppendLine("    [Fact]");
                         csharp.AppendLine($"    public static void Test{csharpFuncNamePrefix}{i}()");
                         csharp.AppendLine("    {");
                         csharp.AppendLine($"        Console.Write(\"Running {csharpFuncNamePrefix}{i}: \");");
-                        csharp.AppendLine($"        S{i} val = {csharpFuncNamePrefix}{i}();");
-                        Random retTestRand = CreateRandForRetTest(i);
-                        retTypes[i].GenerateAssertEqual(csharpWriter, "val", retTestRand);
+                        csharp.AppendLine($"        {retType.GenerateCSharpUse()} val = {csharpFuncNamePrefix}{i}();");
+                        Random retTestRand = CreateRandForTest(i);
+                        retType.GenerateAssertEqual(csharpWriter, "val", retTestRand, "        ");
                         csharp.AppendLine($"        Console.WriteLine(\"OK\");");
                         csharp.AppendLine("    }");
                         csharp.AppendLine("");
@@ -281,7 +397,7 @@ namespace SwiftAbiStressGenerator
             }
         }
 
-        private static Random CreateRandForRetTest(int index)
+        private static Random CreateRandForTest(int index)
         {
             Random retTestRand = new Random(unchecked((int)0xdeadbeef * index + 0x1234));
             return retTestRand;
@@ -447,7 +563,7 @@ stderr:
             public abstract string GenerateCSharpUse();
             public abstract void GenerateValuesAndHash(TextWriter csharp, TextWriter swift, ref Fnv1aHasher hasher, Random rand);
             public abstract void GenerateSwiftHashCombine(StringBuilder sb, string valueName);
-            public abstract void GenerateAssertEqual(TextWriter csharp, string actualIdentifier, Random rand);
+            public abstract void GenerateAssertEqual(TextWriter csharp, string actualIdentifier, Random rand, string indent);
             public abstract int Size { get; }
             public abstract int Alignment { get; }
         }
@@ -587,9 +703,9 @@ stderr:
                 sb.AppendLine($"    hasher.combine({valueName});");
             }
 
-            public override void GenerateAssertEqual(TextWriter csharp, string actualIdentifier, Random rand)
+            public override void GenerateAssertEqual(TextWriter csharp, string actualIdentifier, Random rand, string indent)
             {
-                csharp.Write($"        Assert.Equal(({CSharpType})");
+                csharp.Write($"{indent}Assert.Equal(({CSharpType})");
                 Fnv1aHasher hasher = new();
                 GenerateValuesAndHash(csharp, TextWriter.Null, ref hasher, rand);
                 csharp.Write(", ");
@@ -710,11 +826,11 @@ stderr:
                 }
             }
 
-            public override void GenerateAssertEqual(TextWriter csharp, string actualIdentifier, Random rand)
+            public override void GenerateAssertEqual(TextWriter csharp, string actualIdentifier, Random rand, string indent)
             {
                 for (int i = 0; i < _fields.Length; i++)
                 {
-                    _fields[i].GenerateAssertEqual(csharp, $"{actualIdentifier}.F{i}", rand);
+                    _fields[i].GenerateAssertEqual(csharp, $"{actualIdentifier}.F{i}", rand, indent);
                 }
             }
 
