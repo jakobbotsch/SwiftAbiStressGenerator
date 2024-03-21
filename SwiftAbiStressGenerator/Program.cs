@@ -28,6 +28,8 @@ namespace SwiftAbiStressGenerator
 
             StringBuilder swift = new();
             StringWriter swiftWriter = new StringWriter(swift);
+            swift.AppendLine("// Licensed to the .NET Foundation under one or more agreements.");
+            swift.AppendLine("// The .NET Foundation licenses this file to you under the MIT license.");
             swift.AppendLine("import Foundation");
             swift.AppendLine("");
 
@@ -244,6 +246,9 @@ namespace SwiftAbiStressGenerator
 
                 StringBuilder csharp = new();
                 StringWriter csharpWriter = new StringWriter(csharp);
+
+                csharp.AppendLine("// Licensed to the .NET Foundation under one or more agreements.");
+                csharp.AppendLine("// The .NET Foundation licenses this file to you under the MIT license.");
 
                 if (genReversePinvoke)
                 {
