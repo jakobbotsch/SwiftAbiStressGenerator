@@ -322,9 +322,9 @@ namespace SwiftAbiStressGenerator
                             csharp.Append(", ");
                         csharp.Append("SwiftSelf, ");
                         csharp.Append(retType.GenerateCSharpUse());
-                        csharp.AppendLine("> f, SwiftSelf self);");
+                        csharp.AppendLine("> func, void* funcContext);");
                         csharp.AppendLine("");
-                        csharp.AppendLine("    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvSwift)])]");
+                        csharp.AppendLine("    [UnmanagedCallersOnly(CallConvs = new Type[] { typeof(CallConvSwift) })]");
                         csharp.Append($"    private static {retType.GenerateCSharpUse()} {csharpFuncNamePrefix}{i}Callback(");
                         csharp.AppendJoin(", ", paramTypes.Select((t, i) => $"{t.GenerateCSharpUse()} a{i}"));
                         if (paramTypes.Count > 0)
@@ -357,7 +357,7 @@ namespace SwiftAbiStressGenerator
                         csharp.AppendLine("    {");
                         csharp.AppendLine($"        Console.Write(\"Running {csharpFuncNamePrefix}{i}: \");");
                         csharp.AppendLine($"        ExceptionDispatchInfo ex = null;");
-                        csharp.AppendLine($"        {retType.GenerateCSharpUse()} val = {csharpFuncNamePrefix}{i}(&{csharpFuncNamePrefix}{i}Callback, new SwiftSelf(&ex));");
+                        csharp.AppendLine($"        {retType.GenerateCSharpUse()} val = {csharpFuncNamePrefix}{i}(&{csharpFuncNamePrefix}{i}Callback, &ex);");
                         csharp.AppendLine($"        if (ex != null)");
                         csharp.AppendLine($"            ex.Throw();");
                         csharp.AppendLine($"");
